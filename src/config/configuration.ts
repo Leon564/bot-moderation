@@ -14,12 +14,9 @@ export default () => ({
     moderationEnabled: process.env.MODERATION_ENABLED === 'true',
     autoModerateAll: process.env.AUTO_MODERATE_ALL === 'true',
     autoDeleteMessages: process.env.AUTO_DELETE_MESSAGES === 'true',
-    moderationOnlyMode: process.env.MODERATION_ONLY_MODE === 'true',
     sendModerationWarnings: process.env.SEND_MODERATION_WARNINGS !== 'false',
     personalInfoProtection: process.env.PERSONAL_INFO_PROTECTION !== 'false',
     moderationLevel: process.env.MODERATION_LEVEL || 'STRICT', // STRICT, MODERATE, LENIENT, PRIVACY_ONLY
-    toxicityThreshold: parseFloat(process.env.TOXICITY_THRESHOLD || '0.7'), // 0.0 - 1.0
-    contextAwareness: process.env.CONTEXT_AWARENESS !== 'false',
 
     // Strikes: when a user accumulates N moderated messages of the configured
     // severity within a rolling time window, the bot issues a temporary ban.
@@ -27,7 +24,7 @@ export default () => ({
       threshold: parseInt(process.env.STRIKES_BEFORE_BAN || '3', 10),
       banDuration: process.env.STRIKE_BAN_DURATION || '1h', // '5m' | '1h' | '1d' | '1w' | 'permanent'
       windowHours: parseInt(process.env.STRIKE_WINDOW_HOURS || '24', 10),
-      countSeverity: (process.env.STRIKE_COUNT_SEVERITY || 'high').toLowerCase(), // 'high' | 'medium' (counts medium+high) | 'all'
+      countSeverity: (process.env.STRIKE_COUNT_SEVERITY || 'medium').toLowerCase(), // 'high' | 'medium' (counts medium+high) | 'all'
     },
   },
 

@@ -18,8 +18,6 @@ export class ModerationService {
   private moderationEnabled: boolean;
   private personalInfoProtectionEnabled: boolean;
   private moderationLevel: string;
-  private toxicityThreshold: number;
-  private contextAwareness: boolean;
   private userMessageHistory: Map<string, Array<{message: string, timestamp: number}>> = new Map();
   private readonly CONTEXT_WINDOW_MS = 60000; // 1 minuto para analizar contexto
   private readonly MAX_MESSAGES_TO_ANALYZE = 3; // Analizar últimos 3 mensajes del usuario
@@ -35,14 +33,31 @@ export class ModerationService {
   // Intentionally short: only words that are unequivocally a slur in any
   // common context. Casual swears (mierda, joder, etc.) live in the LLM path
   // because they need context.
+  // Patterns are matched against the *normalized* text (see `normalize()`),
+  // so leetspeak / Cyrillic confusables / spaced-out evasion all hit too.
   private readonly HARD_BLOCKLIST: RegExp[] = [
     /\b(maric[oó]n(es|a|az[oa])?|mariposon)\b/i,
     /\bputo(s)?\s+(de\s+mierda|asqueroso)\b/i,
     /\bn[ei]g(ga|ger|grata)s?\b/i,
     /\bretra(sad[oa]|so)\b/i,
     /\bsubnormal(es)?\b/i,
+    /\bimbecil(es)?\b/i,
     /\bautista\s+de\s+mierda\b/i,
   ];
+
+  // Unicode confusables map (Cyrillic / Greek lookalikes → Latin). Covers the
+  // common evasion vectors; not exhaustive on purpose.
+  private static readonly CONFUSABLES: Record<string, string> = {
+    а: 'a', е: 'e', о: 'o', р: 'p', с: 'c', х: 'x', у: 'y', к: 'k', М: 'M',
+    Α: 'A', Β: 'B', Ε: 'E', Η: 'H', Ι: 'I', Κ: 'K', Μ: 'M', Ν: 'N', Ο: 'O',
+    Ρ: 'P', Τ: 'T', Υ: 'Y', Χ: 'X', Ζ: 'Z',
+  };
+
+  // Leet → letter substitutions only applied where it makes sense (mid-word).
+  private static readonly LEET: Record<string, string> = {
+    '0': 'o', '1': 'i', '3': 'e', '4': 'a', '5': 's', '7': 't',
+    '@': 'a', $: 's',
+  };
 
   constructor(private readonly configService: ConfigService) {
     this.openai = new OpenAI({
@@ -56,15 +71,9 @@ export class ModerationService {
 
     this.moderationEnabled = this.configService.get<boolean>('bot.moderationEnabled') ?? true;
     this.personalInfoProtectionEnabled = this.configService.get<boolean>('bot.personalInfoProtection') ?? true;
-    
-    // Nuevas configuraciones de niveles
     this.moderationLevel = this.configService.get<string>('bot.moderationLevel') ?? 'STRICT';
-    this.toxicityThreshold = this.configService.get<number>('bot.toxicityThreshold') ?? 0.7;
-    this.contextAwareness = this.configService.get<boolean>('bot.contextAwareness') ?? true;
-    
+
     console.log(`🛡️ Nivel de moderación: ${this.moderationLevel}`);
-    console.log(`🎯 Umbral de toxicidad: ${this.toxicityThreshold}`);
-    console.log(`🧠 Análisis contextual: ${this.contextAwareness ? 'ENABLED' : 'DISABLED'}`);
   }
 
   /**
@@ -420,15 +429,48 @@ action:
   }
 
   /**
-   * Catches obvious junk before any LLM call:
+   * Normalizes the message text to neutralize common evasion tricks before
+   * pattern-based checks. Returns a canonicalized lowercase string suitable
+   * for regex matching; the original is preserved for the LLM path so context
+   * isn't lost.
+   *
+   * Three passes:
+   *   1. Unicode confusables (Cyrillic/Greek lookalikes) → Latin.
+   *   2. Leetspeak digit/symbol substitutions ONLY when surrounded by
+   *      letters, so "imbec1l" → "imbecil" but "1234" stays "1234".
+   *   3. Single-char-spacing pattern ("p u t o" → "puto") collapsed when
+   *      we see ≥4 single letters separated by single spaces.
+   */
+  private normalize(text: string): string {
+    let out = '';
+    for (const ch of text) {
+      out += ModerationService.CONFUSABLES[ch] ?? ch;
+    }
+    out = out.toLowerCase();
+
+    // Leet substitutions only inside word boundaries (letter neighbors).
+    out = out.replace(/([a-záéíóúñ])([0-9@$])(?=[a-záéíóúñ])/gi, (_m, a, d) => a + (ModerationService.LEET[d] ?? d));
+    out = out.replace(/(^|[^a-záéíóúñ])([0-9@$])(?=[a-záéíóúñ])/gi, (_m, pre, d) => pre + (ModerationService.LEET[d] ?? d));
+
+    // Collapse 4+ single-letter words separated by spaces into one word.
+    out = out.replace(/(?:\b[a-záéíóúñ]\b\s+){3,}[a-záéíóúñ]\b/gi, (m) => m.replace(/\s+/g, ''));
+
+    return out.trim();
+  }
+
+  /**
+   * Catches obvious junk before any LLM call. All pattern checks run against
+   * the normalized text so leetspeak / spacing / confusables don't slip
+   * through. The original message is what the LLM sees later.
+   *
    *   1. 6+ consecutive identical characters → spam ("AAAAA", "-------").
    *   2. Message of 5+ chars containing no letters at all → symbol blast.
-   *   3. Same message repeated by the same user within 60s → flood.
+   *   3. Same normalized message repeated by the same user within 60s → flood.
    *   4. Word matches the hard-blocklist of slurs → hate speech.
-   * Returns a ModerationResult, or null if nothing tripped.
    */
   private runPreLlmChecks(message: string, username: string): ModerationResult | null {
     const trimmed = message.trim();
+    const normalized = this.normalize(trimmed);
 
     if (this.REPEATED_CHAR_RE.test(trimmed)) {
       return {
@@ -451,7 +493,7 @@ action:
     }
 
     for (const pattern of this.HARD_BLOCKLIST) {
-      if (pattern.test(trimmed)) {
+      if (pattern.test(normalized)) {
         return {
           isAllowed: false,
           severity: 'high',
@@ -464,11 +506,10 @@ action:
 
     const history = this.userMessageHistory.get(username) ?? [];
     const now = Date.now();
-    const normalized = trimmed.toLowerCase();
     const dupe = history.find(
       (entry) =>
         now - entry.timestamp <= this.DEDUP_WINDOW_MS &&
-        entry.message.trim().toLowerCase() === normalized,
+        this.normalize(entry.message.trim()) === normalized,
     );
     if (dupe) {
       return {
