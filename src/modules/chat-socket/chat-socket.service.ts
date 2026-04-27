@@ -30,6 +30,10 @@ export class ChatSocketService implements OnModuleInit, OnModuleDestroy {
   private botUsername: string | null = null;
   private messageHandler: ((msg: ChatMessage) => void) | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  /** Exponential backoff: 1s → 2s → 4s → … capped at 60s. Resets on connect. */
+  private reconnectAttempt = 0;
+  private static readonly RECONNECT_BASE_MS = 1_000;
+  private static readonly RECONNECT_CAP_MS = 60_000;
   private pendingAcks = new Map<string, { resolve: (id: string | null) => void; timer: NodeJS.Timeout }>();
 
   constructor(private readonly configService: ConfigService) {}
@@ -88,6 +92,7 @@ export class ChatSocketService implements OnModuleInit, OnModuleDestroy {
 
     this.socket.on('connect', () => {
       this.logger.log('🔌 Connected to chat socket');
+      this.reconnectAttempt = 0;
       if (this.reconnectTimer) {
         clearTimeout(this.reconnectTimer);
         this.reconnectTimer = null;
@@ -136,9 +141,14 @@ export class ChatSocketService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  private scheduleReconnect(delayMs = 5000) {
+  private scheduleReconnect() {
     if (this.reconnectTimer) return;
-    this.logger.log(`Reconnecting in ${delayMs / 1000}s…`);
+    const delayMs = Math.min(
+      ChatSocketService.RECONNECT_BASE_MS * 2 ** this.reconnectAttempt,
+      ChatSocketService.RECONNECT_CAP_MS,
+    );
+    this.reconnectAttempt += 1;
+    this.logger.log(`Reconnecting in ${(delayMs / 1000).toFixed(1)}s (attempt ${this.reconnectAttempt})…`);
     this.reconnectTimer = setTimeout(async () => {
       this.reconnectTimer = null;
       this.socket?.disconnect();

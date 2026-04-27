@@ -5,14 +5,11 @@ import { MessagesService } from '../chat/messages.service';
 import { ModerationService } from '../chat/moderation.service';
 import { LoggingService } from '../../common/utils/logging.service';
 import { ChatSocketService, ChatMessage } from '../chat-socket/chat-socket.service';
+import { StrikesService } from '../strikes/strikes.service';
+import { ActionsService } from '../actions/actions.service';
 
 type BanDuration = '5m' | '1h' | '1d' | '1w' | 'permanent';
 const VALID_BAN_DURATIONS: BanDuration[] = ['5m', '1h', '1d', '1w', 'permanent'];
-
-interface StrikeRecord {
-  count: number;
-  lastStrikeAt: number;
-}
 
 @Injectable()
 export class BotService implements OnModuleInit {
@@ -20,10 +17,6 @@ export class BotService implements OnModuleInit {
   private openai: OpenAI;
   private moderationPaused = false;
   private pauseEndTime: number | null = null;
-  /** username -> { count, lastStrikeAt }. Resets after a ban or after the
-   *  configured window passes without new infractions. In-memory: lost on
-   *  restart (acceptable — strikes are by definition short-term). */
-  private strikes = new Map<string, StrikeRecord>();
 
   constructor(
     private readonly configService: ConfigService,
@@ -31,6 +24,8 @@ export class BotService implements OnModuleInit {
     private readonly messagesService: MessagesService,
     private readonly moderationService: ModerationService,
     private readonly loggingService: LoggingService,
+    private readonly strikesService: StrikesService,
+    private readonly actionsService: ActionsService,
   ) {
     this.openai = new OpenAI({
       apiKey: this.configService.get<string>('openai.apiKey'),
@@ -96,11 +91,24 @@ export class BotService implements OnModuleInit {
       return;
     }
 
+    // Runtime whitelist (env MOD_WHITELIST) — trusted regulars that opt out of
+    // moderation without needing a chat role.
+    const whitelist = this.configService.get<string[]>('bot.whitelist') ?? [];
+    if (whitelist.includes(name.toLowerCase())) {
+      return;
+    }
+
     this.logger.log(`🛡️ [AUTO-MOD] Moderando mensaje de ${name}...`);
 
     try {
       const userLevel = this.roleToLevelNumber(role);
-      const moderationResult = await this.moderationService.moderateMessage(message, name, userLevel);
+      const reputationHint = await this.computeReputationHint(name);
+      const moderationResult = await this.moderationService.moderateMessage(
+        message,
+        name,
+        userLevel,
+        reputationHint ? { reputationHint } : {},
+      );
 
       if (moderationResult.isAllowed) {
         this.logger.log(`✅ [MOD] Mensaje aprobado de ${name}`);
@@ -121,27 +129,56 @@ export class BotService implements OnModuleInit {
 
       // Record the strike (if its severity counts) BEFORE composing the warning,
       // so we can either append the (count/threshold) progress or upgrade to a ban.
-      const strikeOutcome = this.recordStrike(name, moderationResult.severity);
+      const strikeOutcome = await this.strikesService.record(
+        name,
+        moderationResult.severity,
+        moderationResult.reason ?? '',
+        moderationResult.category ?? '',
+        {
+          threshold: this.configService.get<number>('bot.strikes.threshold') ?? 3,
+          windowMs: (this.configService.get<number>('bot.strikes.windowHours') ?? 24) * 60 * 60 * 1000,
+          countSeverity: ((this.configService.get<string>('bot.strikes.countSeverity') ?? 'medium').toLowerCase() as 'high' | 'medium' | 'all'),
+        },
+      );
 
       const sendWarnings = this.configService.get<boolean>('bot.sendModerationWarnings') ?? true;
       const colorPrefix = this.colorPrefix();
       let publicMessage: string | null = warningMessage;
 
       if (strikeOutcome.reachedThreshold) {
-        const duration = this.getBanDuration();
-        const banReason = `Acumuló ${strikeOutcome.count} advertencias graves (${moderationResult.reason ?? 'sin razón'})`;
+        const duration = await this.getBanDuration(name);
+        const banReason = `Acumuló ${strikeOutcome.count} advertencias (${moderationResult.reason ?? 'sin razón'})`;
         this.messagesService.banUser(name, banReason, duration);
-        this.clearStrikes(name);
-        publicMessage = `🔨 ${name}: Ban temporal (${duration}) por acumular ${strikeOutcome.count} advertencias graves.`;
+        await this.strikesService.clear(name);
+        publicMessage = `🔨 ${name}: Ban temporal (${duration}) por acumular ${strikeOutcome.count} advertencias.`;
         this.logger.log(`🔨 [STRIKES] ${name} alcanzó ${strikeOutcome.count} strikes — ban ${duration} aplicado`);
       } else if (warningMessage && strikeOutcome.counted) {
-        publicMessage = `${warningMessage} (${strikeOutcome.count}/${strikeOutcome.threshold} advertencias graves)`;
+        publicMessage = `${warningMessage} (${strikeOutcome.count}/${strikeOutcome.threshold} advertencias)`;
       }
 
       if (publicMessage && sendWarnings) {
         const warningId = await this.messagesService.sendMessageAndAwaitId(`${colorPrefix}${publicMessage}`);
         if (warningId) this.scheduleWarningDeletion(warningId);
       }
+
+      // Audit log: every blocked message gets a row, regardless of whether
+      // we sent a public warning. Strike-bans are logged as 'ban'; otherwise
+      // we log the LLM/pre-filter action verbatim.
+      const finalAction: 'warn' | 'timeout' | 'ban' = strikeOutcome.reachedThreshold
+        ? 'ban'
+        : moderationResult.action === 'allow'
+        ? 'warn' // shouldn't reach here given !isAllowed, but be safe
+        : moderationResult.action;
+      await this.actionsService.log({
+        username: name,
+        messageContent: message,
+        action: finalAction,
+        severity: moderationResult.severity,
+        reason: moderationResult.reason ?? '',
+        category: moderationResult.category,
+        source: strikeOutcome.reachedThreshold ? 'strike_ban' : moderationResult.source ?? 'llm',
+        llmRaw: moderationResult.llmRaw,
+      });
     } catch (error) {
       this.logger.error(`❌ [MOD] Error en moderación automática: ${(error as Error).message}`);
     }
@@ -348,70 +385,49 @@ Analiza: "${message}"`;
     return textColor ? `^#${textColor} ` : '';
   }
 
-  // ── Strike system ──────────────────────────────────────────────────────
-
   /**
-   * Increment the strike counter for `username` if `severity` qualifies for
-   * counting per the STRIKE_COUNT_SEVERITY config. Returns whether the strike
-   * counted, the resulting count, the threshold, and whether the threshold
-   * has been reached (which the caller turns into a ban).
+   * Build an optional one-line user-reputation hint to inject into the LLM
+   * prompt. Returns null if reputation is disabled or the user has any
+   * recent strike — in those cases the LLM gets no hint and decides plainly.
+   * The hint biases the model toward `allow` for users with clean recent
+   * history, reducing false positives on regulars.
    */
-  private recordStrike(
-    username: string,
-    severity: 'low' | 'medium' | 'high',
-  ): { counted: boolean; count: number; threshold: number; reachedThreshold: boolean } {
-    const threshold = this.configService.get<number>('bot.strikes.threshold') ?? 3;
-    const windowHours = this.configService.get<number>('bot.strikes.windowHours') ?? 24;
-    const countSeverity = (this.configService.get<string>('bot.strikes.countSeverity') ?? 'high').toLowerCase();
-
-    const qualifyingSeverities =
-      countSeverity === 'all'
-        ? ['low', 'medium', 'high']
-        : countSeverity === 'medium'
-        ? ['medium', 'high']
-        : ['high'];
-
-    if (!qualifyingSeverities.includes(severity)) {
-      return { counted: false, count: 0, threshold, reachedThreshold: false };
-    }
-
-    const now = Date.now();
-    const windowMs = windowHours * 60 * 60 * 1000;
-    const existing = this.strikes.get(username);
-
-    // Reset if outside window — strikes age out so a single bad day doesn't
-    // haunt a user forever.
-    if (existing && now - existing.lastStrikeAt > windowMs) {
-      this.strikes.delete(username);
-    }
-
-    const current = this.strikes.get(username) ?? { count: 0, lastStrikeAt: now };
-    current.count += 1;
-    current.lastStrikeAt = now;
-    this.strikes.set(username, current);
-
-    return {
-      counted: true,
-      count: current.count,
-      threshold,
-      reachedThreshold: current.count >= threshold,
-    };
-  }
-
-  private clearStrikes(username: string): void {
-    this.strikes.delete(username);
+  private async computeReputationHint(username: string): Promise<string | null> {
+    const enabled = this.configService.get<boolean>('bot.reputation.enabled') ?? true;
+    if (!enabled) return null;
+    const days = this.configService.get<number>('bot.reputation.windowDays') ?? 7;
+    const windowMs = days * 24 * 60 * 60 * 1000;
+    const recentStrikes = await this.strikesService.countActive(username, windowMs);
+    if (recentStrikes > 0) return null;
+    return `El usuario "${username}" tiene buen historial: 0 advertencias en los últimos ${days} días. Sesgar hacia "allow" salvo evidencia clara de abuso.`;
   }
 
   /**
-   * Read STRIKE_BAN_DURATION from config and validate it against the gateway's
-   * accepted vocabulary. Falls back to '1h' if the value is malformed instead
-   * of letting the backend reject the moderateBan emit silently.
+   * Pick the ban duration based on how many bans the user has already
+   * accumulated inside the ladder window. First ban → first rung, second
+   * → second, etc. Once the ladder is exhausted, reuse the last rung.
+   *
+   * Falls back to STRIKE_BAN_DURATION (legacy single-value config) if
+   * BAN_LADDER is empty.
    */
-  private getBanDuration(): BanDuration {
-    const raw = (this.configService.get<string>('bot.strikes.banDuration') ?? '1h').trim();
-    if ((VALID_BAN_DURATIONS as string[]).includes(raw)) return raw as BanDuration;
-    this.logger.warn(`STRIKE_BAN_DURATION="${raw}" no es válido (usar 5m/1h/1d/1w/permanent). Usando 1h.`);
-    return '1h';
+  private async getBanDuration(username: string): Promise<BanDuration> {
+    const ladderRaw = this.configService.get<string[]>('bot.banLadder') ?? [];
+    const ladder = ladderRaw.filter((d): d is BanDuration => (VALID_BAN_DURATIONS as string[]).includes(d));
+
+    if (ladder.length === 0) {
+      const fallback = (this.configService.get<string>('bot.strikes.banDuration') ?? '1h').trim();
+      if ((VALID_BAN_DURATIONS as string[]).includes(fallback)) return fallback as BanDuration;
+      this.logger.warn(`STRIKE_BAN_DURATION="${fallback}" no es válido. Usando 1h.`);
+      return '1h';
+    }
+
+    const windowDays = this.configService.get<number>('bot.banLadderWindowDays') ?? 30;
+    const windowMs = windowDays * 24 * 60 * 60 * 1000;
+    const previousBans = await this.actionsService.countBansInWindow(username, windowMs);
+
+    // previousBans = 0 → first rung; clamp at last rung when exhausted.
+    const rungIndex = Math.min(previousBans, ladder.length - 1);
+    return ladder[rungIndex];
   }
 
   private formatRemainingTime(milliseconds: number): string {

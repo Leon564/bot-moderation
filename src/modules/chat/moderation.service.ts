@@ -2,13 +2,17 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import OpenAI from 'openai';
 
-interface ModerationResult {
+export interface ModerationResult {
   isAllowed: boolean;
   reason?: string;
   severity: 'low' | 'medium' | 'high';
   category?: string;
   action: 'allow' | 'warn' | 'timeout' | 'ban';
   isPersonalInfo?: boolean; // Nueva propiedad para identificar información personal
+  /** Where the decision came from. Useful for auditing and metrics. */
+  source?: 'pre_filter' | 'llm' | 'llm_cached' | 'fallback' | 'personal_info';
+  /** Raw text from the LLM (only set when source = 'llm'). */
+  llmRaw?: string;
 }
 
 @Injectable()
@@ -21,6 +25,22 @@ export class ModerationService {
   private userMessageHistory: Map<string, Array<{message: string, timestamp: number}>> = new Map();
   private readonly CONTEXT_WINDOW_MS = 60000; // 1 minuto para analizar contexto
   private readonly MAX_MESSAGES_TO_ANALYZE = 3; // Analizar últimos 3 mensajes del usuario
+
+  // ── LLM circuit breaker ────────────────────────────────────────────────
+  // After N consecutive LLM failures the breaker opens for COOLDOWN_MS, during
+  // which the LLM call is skipped and we fall back to the regex-only path.
+  // Auto-closes on the next success after the cool-down expires.
+  private llmFailureStreak = 0;
+  private llmCircuitOpenUntil = 0;
+  private static readonly LLM_FAIL_THRESHOLD = 5;
+  private static readonly LLM_COOLDOWN_MS = 2 * 60 * 1000;
+
+  // ── LLM decision cache ────────────────────────────────────────────────
+  // LRU + TTL cache keyed by normalized message content. A flood of identical
+  // spam messages from different users only burns a single LLM call.
+  private llmCache = new Map<string, { result: ModerationResult; expiresAt: number }>();
+  private llmCacheMaxEntries = 1000;
+  private llmCacheTtlMs = 5 * 60 * 1000;
 
   // Pre-LLM spam patterns. These hit before any model call so deterministic
   // junk like "AAAAA" or "------" stops in microseconds without burning tokens
@@ -73,16 +93,43 @@ export class ModerationService {
     this.personalInfoProtectionEnabled = this.configService.get<boolean>('bot.personalInfoProtection') ?? true;
     this.moderationLevel = this.configService.get<string>('bot.moderationLevel') ?? 'STRICT';
 
+    this.llmCacheTtlMs = this.configService.get<number>('bot.llmCache.ttlMs') ?? this.llmCacheTtlMs;
+    this.llmCacheMaxEntries = this.configService.get<number>('bot.llmCache.maxEntries') ?? this.llmCacheMaxEntries;
+
     console.log(`🛡️ Nivel de moderación: ${this.moderationLevel}`);
+  }
+
+  /** LRU read with TTL expiry. Promotes the hit entry to most-recent. */
+  private cacheGet(key: string): ModerationResult | null {
+    const entry = this.llmCache.get(key);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+      this.llmCache.delete(key);
+      return null;
+    }
+    // Re-insert to bump LRU position.
+    this.llmCache.delete(key);
+    this.llmCache.set(key, entry);
+    return entry.result;
+  }
+
+  private cacheSet(key: string, result: ModerationResult): void {
+    if (this.llmCache.size >= this.llmCacheMaxEntries) {
+      // Map preserves insertion order, so the first key is the oldest.
+      const oldestKey = this.llmCache.keys().next().value;
+      if (oldestKey) this.llmCache.delete(oldestKey);
+    }
+    this.llmCache.set(key, { result, expiresAt: Date.now() + this.llmCacheTtlMs });
   }
 
   /**
    * Modera un mensaje usando GPT-4
    */
   async moderateMessage(
-    message: string, 
-    username: string, 
-    userLevel: number = 1
+    message: string,
+    username: string,
+    userLevel: number = 1,
+    options: { reputationHint?: string } = {},
   ): Promise<ModerationResult> {
     
     // Si la moderación está deshabilitada, permitir todo
@@ -122,7 +169,8 @@ export class ModerationService {
             reason: personalInfoCheck.reason,
             category: 'personal_information',
             action: 'timeout',
-            isPersonalInfo: true
+            isPersonalInfo: true,
+            source: 'personal_info',
           };
         }
       }
@@ -151,15 +199,38 @@ export class ModerationService {
           reason: personalInfoCheck.reason,
           category: 'personal_information',
           action: 'timeout',
-          isPersonalInfo: true
+          isPersonalInfo: true,
+          source: 'personal_info',
         };
       }
+    }
+
+    // Cache lookup — skips both the LLM call and the circuit-breaker bypass.
+    // We don't cache when a per-user reputation hint is in play; the result
+    // would be biased and would poison subsequent calls from other users.
+    const cacheKey = this.normalize(message);
+    const useCache = !options.reputationHint;
+    if (useCache) {
+      const cached = this.cacheGet(cacheKey);
+      if (cached) {
+        console.log(`💾 [MOD] cache hit para ${username}: "${message}"`);
+        return { ...cached, source: 'llm_cached' };
+      }
+    }
+
+    // Circuit breaker: if too many recent LLM calls failed, skip the LLM
+    // entirely until the cool-down expires.
+    if (Date.now() < this.llmCircuitOpenUntil) {
+      console.warn('⚠️ [MOD] Circuit breaker abierto — usando fallback regex');
+      return this.fallbackModeration(message, username, userLevel);
     }
 
     try {
       console.log(`🛡️ [MOD] Moderando mensaje de ${username}: "${message}"`);
 
-      const systemPrompt = this.buildModerationPrompt();
+      const systemPrompt = options.reputationHint
+        ? `${this.buildModerationPrompt()}\n\nNOTA SOBRE EL USUARIO: ${options.reputationHint}`
+        : this.buildModerationPrompt();
 
       const response = await this.openai.chat.completions.create({
         model: this.model,
@@ -172,22 +243,33 @@ export class ModerationService {
       });
 
       const result = response.choices[0]?.message?.content?.trim();
-      
+
       if (!result) {
         console.warn('⚠️ [MOD] Respuesta vacía del moderador, permitiendo mensaje');
+        // Empty response does NOT count as a failure — the API responded.
+        this.llmFailureStreak = 0;
         return {
           isAllowed: true,
           severity: 'low',
-          action: 'allow'
+          action: 'allow',
         };
       }
 
-      return this.parseModerationResult(result, message, username);
-      
+      // Successful LLM call — close the breaker and reset the failure streak.
+      this.llmFailureStreak = 0;
+      this.llmCircuitOpenUntil = 0;
+      const parsed = this.parseModerationResult(result, message, username);
+      if (useCache) this.cacheSet(cacheKey, parsed);
+      return parsed;
     } catch (error) {
-      console.error('❌ [MOD] Error en moderación automática:', error);
-      
-      // En caso de error, usar moderación básica local
+      this.llmFailureStreak += 1;
+      console.error(`❌ [MOD] Error en LLM (${this.llmFailureStreak}/${ModerationService.LLM_FAIL_THRESHOLD}):`, error);
+
+      if (this.llmFailureStreak >= ModerationService.LLM_FAIL_THRESHOLD) {
+        this.llmCircuitOpenUntil = Date.now() + ModerationService.LLM_COOLDOWN_MS;
+        console.warn(`🔌 [MOD] Circuit breaker ABIERTO por ${ModerationService.LLM_COOLDOWN_MS / 1000}s — fallback regex temporal`);
+      }
+
       return this.fallbackModeration(message, username, userLevel);
     }
   }
@@ -282,7 +364,9 @@ action:
         severity: parsed.severity || 'medium',
         reason: parsed.reason,
         category: parsed.category,
-        action: parsed.action || (parsed.allowed ? 'allow' : 'warn')
+        action: parsed.action || (parsed.allowed ? 'allow' : 'warn'),
+        source: 'llm',
+        llmRaw: result,
       };
 
       console.log(`🛡️ [MOD] Resultado para ${username}:`, moderationResult);
@@ -320,7 +404,8 @@ action:
         severity: 'medium',
         reason: 'Lenguaje inapropiado detectado',
         category: 'toxicity',
-        action: userLevel >= 3 ? 'warn' : 'timeout'
+        action: userLevel >= 3 ? 'warn' : 'timeout',
+        source: 'fallback',
       };
     }
     
@@ -332,7 +417,8 @@ action:
         severity: 'medium',
         reason: 'Posible spam detectado',
         category: 'spam',
-        action: 'warn'
+        action: 'warn',
+        source: 'fallback',
       };
     }
     
@@ -479,6 +565,7 @@ action:
         reason: 'Spam (caracteres repetidos)',
         category: 'spam',
         action: 'timeout',
+        source: 'pre_filter',
       };
     }
 
@@ -489,6 +576,7 @@ action:
         reason: 'Spam (mensaje sin contenido legible)',
         category: 'spam',
         action: 'timeout',
+        source: 'pre_filter',
       };
     }
 
@@ -500,6 +588,7 @@ action:
           reason: 'Lenguaje de odio / slur',
           category: 'toxicity',
           action: 'timeout',
+          source: 'pre_filter',
         };
       }
     }
@@ -518,6 +607,7 @@ action:
         reason: 'Spam (mensaje duplicado)',
         category: 'spam',
         action: 'timeout',
+        source: 'pre_filter',
       };
     }
 
