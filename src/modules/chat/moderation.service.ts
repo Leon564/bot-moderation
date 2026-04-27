@@ -158,11 +158,12 @@ export class ModerationService {
       if (this.personalInfoProtectionEnabled) {
         // Agregar mensaje actual al historial del usuario
         this.addToUserHistory(username, message);
-        
+
         // Analizar mensaje actual y contexto reciente SOLO para información personal
         const personalInfoCheck = await this.detectPersonalInformationWithContext(username, message);
         if (personalInfoCheck) {
           console.log(`🚨 [PRIVACY-ONLY] Información personal detectada de ${username}: ${personalInfoCheck.type} - ${personalInfoCheck.context || 'mensaje único'}`);
+          this.userMessageHistory.delete(username);
           return {
             isAllowed: false,
             severity: 'high',
@@ -188,11 +189,12 @@ export class ModerationService {
     if (this.personalInfoProtectionEnabled) {
       // Agregar mensaje actual al historial del usuario
       this.addToUserHistory(username, message);
-      
+
       // Analizar mensaje actual y contexto reciente
       const personalInfoCheck = await this.detectPersonalInformationWithContext(username, message);
       if (personalInfoCheck) {
         console.log(`🚨 [PERSONAL-INFO] Información personal detectada de ${username}: ${personalInfoCheck.type} - ${personalInfoCheck.context || 'mensaje único'}`);
+        this.userMessageHistory.delete(username);
         return {
           isAllowed: false,
           severity: 'high',
