@@ -24,6 +24,26 @@ export class ModerationService {
   private readonly CONTEXT_WINDOW_MS = 60000; // 1 minuto para analizar contexto
   private readonly MAX_MESSAGES_TO_ANALYZE = 3; // Analizar últimos 3 mensajes del usuario
 
+  // Pre-LLM spam patterns. These hit before any model call so deterministic
+  // junk like "AAAAA" or "------" stops in microseconds without burning tokens
+  // on it.
+  private readonly REPEATED_CHAR_RE = /(.)\1{5,}/;          // 6+ identical chars in a row
+  private readonly NO_LETTERS_RE = /^[^A-Za-zÁ-ÿ]{5,}$/;     // 5+ chars and no letters at all
+  private readonly DEDUP_WINDOW_MS = 60_000;                 // same message twice within 1m = spam
+
+  // Slurs / hate speech that we always block regardless of MODERATION_LEVEL.
+  // Intentionally short: only words that are unequivocally a slur in any
+  // common context. Casual swears (mierda, joder, etc.) live in the LLM path
+  // because they need context.
+  private readonly HARD_BLOCKLIST: RegExp[] = [
+    /\b(maric[oó]n(es|a|az[oa])?|mariposon)\b/i,
+    /\bputo(s)?\s+(de\s+mierda|asqueroso)\b/i,
+    /\bn[ei]g(ga|ger|grata)s?\b/i,
+    /\bretra(sad[oa]|so)\b/i,
+    /\bsubnormal(es)?\b/i,
+    /\bautista\s+de\s+mierda\b/i,
+  ];
+
   constructor(private readonly configService: ConfigService) {
     this.openai = new OpenAI({
       apiKey: this.configService.get<string>('openai.apiKey'),
@@ -63,6 +83,16 @@ export class ModerationService {
         severity: 'low',
         action: 'allow'
       };
+    }
+
+    // Cheap deterministic checks first — repeated chars, symbol-only blasts,
+    // duplicated messages, and unequivocal slurs. These don't need an LLM and
+    // don't change with MODERATION_LEVEL: hate speech is hate speech, spam is
+    // spam.
+    const preCheck = this.runPreLlmChecks(message, username);
+    if (preCheck) {
+      this.addToUserHistory(username, message);
+      return preCheck;
     }
 
     // Si está en modo PRIVACY_ONLY, agregar al historial pero solo moderar información personal
@@ -118,18 +148,18 @@ export class ModerationService {
     }
 
     try {
-      console.log(`🛡️ [MOD] Moderando mensaje de ${username} (nivel ${userLevel}): "${message}"`);
+      console.log(`🛡️ [MOD] Moderando mensaje de ${username}: "${message}"`);
 
-      const systemPrompt = this.buildModerationPrompt(userLevel);
-      
+      const systemPrompt = this.buildModerationPrompt();
+
       const response = await this.openai.chat.completions.create({
-        model: this.model, // Modelo más económico pero efectivo para moderación
+        model: this.model,
         messages: [
           { role: 'system', content: systemPrompt },
-          { role: 'user', content: `Usuario: ${username} (Nivel: ${userLevel})\nMensaje: "${message}"` }
+          { role: 'user', content: `Mensaje a moderar:\n"${message}"` },
         ],
         max_tokens: 200,
-        temperature: 0.1, // Baja temperatura para respuestas consistentes
+        temperature: 0.1,
       });
 
       const result = response.choices[0]?.message?.content?.trim();
@@ -154,196 +184,70 @@ export class ModerationService {
   }
 
   /**
-   * Construye el prompt de moderación según el nivel del usuario y configuración
+   * Builds the moderation prompt. Designed to read like instructions to a
+   * human moderator: short, concrete examples, no numeric thresholds, no
+   * abstract level matrix. The LLM does best when told "block X, allow Y"
+   * with examples of each.
    */
-  private buildModerationPrompt(userLevel: number): string {
-    const levelConfig = this.getModerationConfig();
-    
-    const baseRules = `
-Eres un moderador automático de un chat de anime/manga con nivel de severidad: ${this.moderationLevel}.
+  private buildModerationPrompt(): string {
+    const tone = this.getToneForLevel();
 
-INFORMACIÓN PERSONAL (SIEMPRE ESTRICTO):
-❌ SIEMPRE ELIMINAR: Números de teléfono, emails, usuarios de redes sociales compartidos
-❌ NUNCA PERMITIR: Información personal sin importar el nivel de moderación
+    return `Eres un moderador humano de un chat de anime/manga en español. Tu trabajo es eliminar lo que un mod razonable eliminaría y dejar pasar todo lo demás. Sé natural y consistente, no robótico.
 
-TOXICIDAD Y CONTENIDO (VARIABLE POR NIVEL):
-${levelConfig.rules}
+POSTURA: ${tone}
 
-CONTEXTO Y ANÁLISIS:
-${this.contextAwareness ? 
-  '✅ Considera el contexto, sarcasmo, bromas amigables y relaciones entre usuarios' : 
-  '❌ Análisis directo sin considerar contexto adicional'
-}
+ELIMINA SIEMPRE:
+- Insultos directos a otros usuarios ("eres un X", "X de mierda").
+- Discriminación, slurs racistas/homofóbicos/transfóbicos, hate speech.
+- Acoso o ataques sostenidos a una persona.
+- Spam: texto repetido, flood, símbolos sin sentido, mensajes idénticos seguidos.
+- Amenazas creíbles.
+- Información personal compartida (teléfonos, emails, "agréguenme en @...", etc.).
 
-UMBRAL DE TOXICIDAD: ${this.toxicityThreshold} (0.0 = muy permisivo, 1.0 = muy estricto)
+DEJA PASAR:
+- Lenguaje fuerte casual sin destinatario ("qué mierda", "joder", "wtf", "puta locura").
+- Bromas, sarcasmo, ironía, debate apasionado entre usuarios.
+- Off-topic / conversación normal del chat.
+- Memes, exageraciones, "salseo" de fandom.
+- Opiniones fuertes pero no agresivas ("este anime es basura", "odio ese personaje").
+- Menciones normales: "@usuario hola", "@usuario qué onda".
 
-NO MODERES POR:
-1. ✅ Mensajes cortos o de pocas palabras
-2. ✅ Conversaciones normales fuera del tema (anime/manga)
-3. ✅ Bromas ligeras entre amigos conocidos
-4. ✅ Expresiones emocionales normales
-5. ✅ Opiniones fuertes pero respetuosas
-6. ✅ Enlaces normales o recomendaciones
-7. ✅ Apodos cariñosos entre usuarios frecuentes
+EJEMPLOS:
+- "jodanse" / "vayanse a la mierda" lanzado al chat → eliminar (insulto colectivo agresivo).
+- "qué mierda este capítulo" → permitir (expresión, no insulto).
+- "puto" usado contra alguien → eliminar.
+- "qué puto crack ese personaje" → permitir (admiración).
+- "Gays-----------" o "AAAAAAA" → eliminar (spam).
+- "no me gustó el final" / "esa escena fue un asco" → permitir (opinión).
+- "mi número es 555-1234" → eliminar (info personal).
+- "@user crees que…" → permitir (mención normal).
 
-NIVELES DE USUARIO:
-- Nivel 1: No registrado (moderación ${levelConfig.userLevelModeration.level1})
-- Nivel 2: Registrado (moderación ${levelConfig.userLevelModeration.level2})
-- Nivel 3: Moderador (moderación ${levelConfig.userLevelModeration.level3})
-- Nivel 4: Admin (moderación ${levelConfig.userLevelModeration.level4})`;
+RESPONDE SOLO JSON, sin markdown:
+{"allowed": true|false, "severity": "low"|"medium"|"high", "reason": "una frase breve", "category": "spam"|"toxicity"|"hate"|"harassment"|"personal_info"|"offtopic"|"illegal", "action": "allow"|"warn"|"timeout"|"ban"}
 
-    const levelSpecificRules = this.getLevelSpecificRules(userLevel);
-
-    return `${baseRules}
-
-${levelSpecificRules}
-
-RESPONDE EN FORMATO JSON:
-{
-  "allowed": true/false,
-  "severity": "low"/"medium"/"high", 
-  "reason": "explicación breve",
-  "category": "spam"/"nsfw"/"toxicity"/"offtopic"/"promotion"/"illegal"/"personal_info",
-  "action": "allow"/"warn"/"timeout"/"ban",
-  "confidence": 0.0-1.0,
-  "context_considered": true/false
-}
-
-ACCIONES SEGÚN NIVEL:
-${levelConfig.actions}`;
+action:
+- allow → si allowed es true.
+- warn → contenido borderline; lenguaje fuerte usado contra alguien pero no extremo.
+- timeout → insultos directos, hate speech leve, spam, info personal.
+- ban → amenazas creíbles, hate speech severo, comportamiento manifiestamente abusivo.`;
   }
 
   /**
-   * Obtiene la configuración según el nivel de moderación
+   * Per-mode "tone": one short sentence that biases the model toward more or
+   * less intervention without changing the rule list.
    */
-  private getModerationConfig() {
+  private getToneForLevel(): string {
     switch (this.moderationLevel) {
       case 'STRICT':
-        return {
-          rules: `
-❌ ELIMINAR: Cualquier insulto directo, groserías hacia usuarios, spam evidente
-❌ ELIMINAR: Contenido sexual explícito o referencias sexuales fuertes
-❌ ELIMINAR: Amenazas, discriminación, hate speech
-❌ ELIMINAR: Contenido claramente ilegal
-⚠️ ADVERTIR: Lenguaje fuerte ocasional, discusiones acaloradas`,
-          userLevelModeration: {
-            level1: 'muy estricta',
-            level2: 'estricta', 
-            level3: 'moderada',
-            level4: 'relajada'
-          },
-          actions: `
-- allow: Solo contenido completamente apropiado
-- warn: Lenguaje fuerte ocasional, discusiones menores
-- timeout: Insultos directos, spam, contenido sexual
-- ban: Amenazas, discriminación grave, contenido ilegal`
-        };
-        
+        return 'estricta — ante la duda, modera. Cero tolerancia a insultos y groserías agresivas.';
       case 'MODERATE':
-        return {
-          rules: `
-❌ ELIMINAR: Insultos directos maliciosos, groserías ofensivas repetidas
-❌ ELIMINAR: Contenido sexual explícito
-❌ ELIMINAR: Amenazas directas, discriminación seria
-❌ ELIMINAR: Spam masivo evidente
-✅ PERMITIR: Lenguaje fuerte ocasional, bromas pesadas entre amigos
-✅ PERMITIR: Discusiones acaloradas pero no ofensivas`,
-          userLevelModeration: {
-            level1: 'estricta',
-            level2: 'moderada',
-            level3: 'relajada', 
-            level4: 'mínima'
-          },
-          actions: `
-- allow: Contenido apropiado, lenguaje fuerte ocasional
-- warn: Discusiones acaloradas, lenguaje borderline
-- timeout: Insultos maliciosos, spam evidente
-- ban: Amenazas directas, discriminación seria`
-        };
-        
+        return 'equilibrada — modera lo claramente ofensivo o spam. Permite el lenguaje fuerte casual.';
       case 'LENIENT':
-        return {
-          rules: `
-❌ ELIMINAR SOLO: Insultos extremadamente ofensivos y maliciosos
-❌ ELIMINAR SOLO: Amenazas directas creíbles
-❌ ELIMINAR SOLO: Discriminación grave y hate speech
-❌ ELIMINAR SOLO: Contenido claramente ilegal
-✅ PERMITIR: Lenguaje fuerte, groserías generales
-✅ PERMITIR: Bromas pesadas, sarcasmo, ironía
-✅ PERMITIR: Discusiones acaloradas y debates intensos
-✅ PERMITIR: Contenido sexual no explícito (referencias, insinuaciones)`,
-          userLevelModeration: {
-            level1: 'moderada',
-            level2: 'relajada',
-            level3: 'mínima',
-            level4: 'casi nula'
-          },
-          actions: `
-- allow: Amplio rango de contenido, incluyendo lenguaje fuerte
-- warn: Solo contenido borderline muy serio
-- timeout: Insultos extremos, amenazas indirectas
-- ban: Solo amenazas directas, discriminación extrema`
-        };
-
+        return 'permisiva — solo modera lo claramente abusivo (insultos directos, hate speech, amenazas, spam). Permite groserías casuales y debates intensos.';
       case 'PRIVACY_ONLY':
-        return {
-          rules: `
-✅ PERMITIR TODO: Insultos, groserías, lenguaje fuerte, contenido sexual, debates
-✅ PERMITIR TODO: Spam, conversaciones off-topic, bromas pesadas
-✅ PERMITIR TODO: Cualquier tipo de contenido conversacional
-❌ ELIMINAR SOLO: Información personal (teléfonos, emails, redes sociales)
-🎯 MODO PRIVACIDAD: Solo protección de datos personales, sin moderación de contenido`,
-          userLevelModeration: {
-            level1: 'solo privacidad',
-            level2: 'solo privacidad',
-            level3: 'solo privacidad',
-            level4: 'solo privacidad'
-          },
-          actions: `
-- allow: TODO el contenido conversacional (insultos, groserías, etc.)
-- warn: NUNCA por contenido, solo por información personal
-- timeout: SOLO por compartir información personal
-- ban: SOLO por spam masivo de información personal`
-        };
-        
+        return 'no moderes contenido conversacional; solo bloquea información personal y spam evidente.';
       default:
-        // Fallback a STRICT si hay un valor inválido
-        this.moderationLevel = 'STRICT';
-        return this.getModerationConfig();
-    }
-  }
-
-  /**
-   * Reglas específicas según el nivel del usuario
-   */
-  private getLevelSpecificRules(userLevel: number): string {
-    switch (userLevel) {
-      case 1: // No registrado
-        return `USUARIO NO REGISTRADO - MODERACIÓN ENFOCADA:
-- Vigilar spam más estrictamente
-- Cuidado con insultos o groserías
-- Permitir conversaciones normales aunque sean off-topic`;
-        
-      case 2: // Registrado
-        return `USUARIO REGISTRADO - MODERACIÓN BÁSICA:
-- Solo moderar insultos claros y spam
-- Permitir todo tipo de conversaciones casuales
-- Libertad para expresarse normalmente`;
-        
-      case 3: // Moderador
-        return `MODERADOR - MODERACIÓN MÍNIMA:
-- Solo intervenir en casos graves de insultos o amenazas
-- Permitir lenguaje directo y expresiones fuertes
-- Libertad casi total de expresión`;
-        
-      case 4: // Admin
-        return `ADMINISTRADOR - SIN MODERACIÓN:
-- Solo bloquear contenido claramente ilegal
-- Libertad completa de expresión
-- Confiar en su criterio como admin`;
-        
-      default:
-        return `USUARIO DESCONOCIDO - MODERACIÓN ESTRICTA`;
+        return 'equilibrada.';
     }
   }
 
@@ -513,6 +417,70 @@ ${levelConfig.actions}`;
       default:
         return null;
     }
+  }
+
+  /**
+   * Catches obvious junk before any LLM call:
+   *   1. 6+ consecutive identical characters → spam ("AAAAA", "-------").
+   *   2. Message of 5+ chars containing no letters at all → symbol blast.
+   *   3. Same message repeated by the same user within 60s → flood.
+   *   4. Word matches the hard-blocklist of slurs → hate speech.
+   * Returns a ModerationResult, or null if nothing tripped.
+   */
+  private runPreLlmChecks(message: string, username: string): ModerationResult | null {
+    const trimmed = message.trim();
+
+    if (this.REPEATED_CHAR_RE.test(trimmed)) {
+      return {
+        isAllowed: false,
+        severity: 'medium',
+        reason: 'Spam (caracteres repetidos)',
+        category: 'spam',
+        action: 'timeout',
+      };
+    }
+
+    if (this.NO_LETTERS_RE.test(trimmed)) {
+      return {
+        isAllowed: false,
+        severity: 'medium',
+        reason: 'Spam (mensaje sin contenido legible)',
+        category: 'spam',
+        action: 'timeout',
+      };
+    }
+
+    for (const pattern of this.HARD_BLOCKLIST) {
+      if (pattern.test(trimmed)) {
+        return {
+          isAllowed: false,
+          severity: 'high',
+          reason: 'Lenguaje de odio / slur',
+          category: 'toxicity',
+          action: 'timeout',
+        };
+      }
+    }
+
+    const history = this.userMessageHistory.get(username) ?? [];
+    const now = Date.now();
+    const normalized = trimmed.toLowerCase();
+    const dupe = history.find(
+      (entry) =>
+        now - entry.timestamp <= this.DEDUP_WINDOW_MS &&
+        entry.message.trim().toLowerCase() === normalized,
+    );
+    if (dupe) {
+      return {
+        isAllowed: false,
+        severity: 'medium',
+        reason: 'Spam (mensaje duplicado)',
+        category: 'spam',
+        action: 'timeout',
+      };
+    }
+
+    return null;
   }
 
   /**

@@ -76,6 +76,14 @@ export class BotService implements OnModuleInit {
     const autoModerateAll = this.configService.get<boolean>('bot.autoModerateAll');
     if (!autoModerateAll) return;
 
+    // Don't moderate other staff. Mods/admins/superAdmins/bots are trusted by
+    // the chat permission model — moderating them would cause friction with
+    // little benefit, and the gateway would refuse most actions against them
+    // anyway (mods/bots can't ban or delete admin/superAdmin content).
+    if (['mod', 'admin', 'superAdmin', 'bot'].includes(role)) {
+      return;
+    }
+
     this.logger.log(`🛡️ [AUTO-MOD] Moderando mensaje de ${name}...`);
 
     try {
