@@ -49,6 +49,12 @@ export class ModerationService {
   private readonly NO_LETTERS_RE = /^[^A-Za-zÁ-ÿ]{5,}$/;     // 5+ chars and no letters at all
   private readonly DEDUP_WINDOW_MS = 60_000;                 // same message twice within 1m = spam
 
+  // Mensajes que el operador considera nunca-spam por política: el comando
+  // !music y las menciones <@usuario>. Aún se evalúan contra el blocklist de
+  // toxicidad y contra el LLM, pero los chequeos de spam pre-LLM se saltan.
+  private readonly MUSIC_COMMAND_RE = /^!music(\s|$)/i;
+  private readonly MENTION_RE = /<@[^\s>]+>/;
+
   // Slurs / hate speech that we always block regardless of MODERATION_LEVEL.
   // Intentionally short: only words that are unequivocally a slur in any
   // common context. Casual swears (mierda, joder, etc.) live in the LLM path
@@ -303,7 +309,8 @@ DEJA PASAR:
 - Off-topic / conversación normal del chat.
 - Memes, exageraciones, "salseo" de fandom.
 - Opiniones fuertes pero no agresivas ("este anime es basura", "odio ese personaje").
-- Menciones normales: "@usuario hola", "@usuario qué onda".
+- Menciones normales: "@usuario hola", "@usuario qué onda", "<@usuario> ...".
+- Comandos !music ("!music despacito", "!music bohemian rhapsody"), incluso si se repiten — nunca son spam.
 
 EJEMPLOS:
 - "jodanse" / "vayanse a la mierda" lanzado al chat → eliminar (insulto colectivo agresivo).
@@ -560,6 +567,26 @@ action:
     const trimmed = message.trim();
     const normalized = this.normalize(trimmed);
 
+    // Slurs y hate speech siempre aplican, incluso para !music o menciones.
+    for (const pattern of this.HARD_BLOCKLIST) {
+      if (pattern.test(normalized)) {
+        return {
+          isAllowed: false,
+          severity: 'high',
+          reason: 'Lenguaje de odio / slur',
+          category: 'toxicity',
+          action: 'timeout',
+          source: 'pre_filter',
+        };
+      }
+    }
+
+    // Política: comandos !music y menciones <@usuario> nunca se consideran
+    // spam. Saltamos los chequeos de repetición/símbolos/duplicado.
+    if (this.MUSIC_COMMAND_RE.test(trimmed) || this.MENTION_RE.test(trimmed)) {
+      return null;
+    }
+
     if (this.REPEATED_CHAR_RE.test(trimmed)) {
       return {
         isAllowed: false,
@@ -580,19 +607,6 @@ action:
         action: 'timeout',
         source: 'pre_filter',
       };
-    }
-
-    for (const pattern of this.HARD_BLOCKLIST) {
-      if (pattern.test(normalized)) {
-        return {
-          isAllowed: false,
-          severity: 'high',
-          reason: 'Lenguaje de odio / slur',
-          category: 'toxicity',
-          action: 'timeout',
-          source: 'pre_filter',
-        };
-      }
     }
 
     const history = this.userMessageHistory.get(username) ?? [];
