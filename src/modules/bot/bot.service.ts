@@ -57,6 +57,11 @@ export class BotService implements OnModuleInit {
     // around as a username on this chat — harmless to keep.
     if (name.toLowerCase() === 'aria') return;
 
+    // Los bots no interactúan entre ellos. Cualquier mensaje cuyo autor tenga
+    // role 'bot' se ignora por completo — sin log, sin interpretación de
+    // comandos, sin moderación — para evitar bucles o ruido cruzado.
+    if (role === 'bot') return;
+
     // Persist a log of the message for diagnostics / context.
     await this.loggingService.saveLog(name, message);
 
@@ -83,11 +88,12 @@ export class BotService implements OnModuleInit {
     const autoModerateAll = this.configService.get<boolean>('bot.autoModerateAll');
     if (!autoModerateAll) return;
 
-    // Don't moderate other staff. Mods/admins/superAdmins/bots are trusted by
-    // the chat permission model — moderating them would cause friction with
+    // Don't moderate other staff. Mods/admins/superAdmins are trusted by the
+    // chat permission model — moderating them would cause friction with
     // little benefit, and the gateway would refuse most actions against them
-    // anyway (mods/bots can't ban or delete admin/superAdmin content).
-    if (['mod', 'admin', 'superAdmin', 'bot'].includes(role)) {
+    // anyway (mods can't ban or delete admin/superAdmin content). Bots ya
+    // salieron arriba con el early return.
+    if (['mod', 'admin', 'superAdmin'].includes(role)) {
       return;
     }
 
