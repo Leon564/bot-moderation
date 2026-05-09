@@ -7,6 +7,7 @@ import { LoggingService } from '../../common/utils/logging.service';
 import { ChatSocketService, ChatMessage } from '../chat-socket/chat-socket.service';
 import { StrikesService } from '../strikes/strikes.service';
 import { ActionsService } from '../actions/actions.service';
+import { WhitelistService } from '../whitelist/whitelist.service';
 
 type BanDuration = '5m' | '1h' | '1d' | '1w' | 'permanent';
 const VALID_BAN_DURATIONS: BanDuration[] = ['5m', '1h', '1d', '1w', 'permanent'];
@@ -26,6 +27,7 @@ export class BotService implements OnModuleInit {
     private readonly loggingService: LoggingService,
     private readonly strikesService: StrikesService,
     private readonly actionsService: ActionsService,
+    private readonly whitelistService: WhitelistService,
   ) {
     this.openai = new OpenAI({
       apiKey: this.configService.get<string>('openai.apiKey'),
@@ -67,6 +69,9 @@ export class BotService implements OnModuleInit {
 
     // Moderation control commands (only mods/admins can issue them).
     if (this.isPrivilegedRole(role)) {
+      // Cheap regex-based whitelist commands first — no LLM round-trip.
+      if (await this.handleWhitelistCommand(message, name)) return;
+
       const handled = await this.interpretModerationCommand(message, name, this.getLevelName(role));
       if (handled) return;
     }
@@ -97,10 +102,10 @@ export class BotService implements OnModuleInit {
       return;
     }
 
-    // Runtime whitelist (env MOD_WHITELIST) — trusted regulars that opt out of
-    // moderation without needing a chat role.
-    const whitelist = this.configService.get<string[]>('bot.whitelist') ?? [];
-    if (whitelist.includes(name.toLowerCase())) {
+    // Runtime whitelist — trusted regulars that opt out of moderation without
+    // needing a chat role. Backed by the `mod_whitelist` collection so admins
+    // can edit it live (chat command or directly in Mongo) without a redeploy.
+    if (await this.whitelistService.isWhitelisted(name)) {
       return;
     }
 
@@ -239,6 +244,75 @@ export class BotService implements OnModuleInit {
 
   private isPrivilegedRole(role: string): boolean {
     return ['mod', 'admin', 'superAdmin'].includes(role);
+  }
+
+  // ── Whitelist chat commands ────────────────────────────────────────────
+
+  /**
+   * Handle `!whitelist` / `!wl` admin commands. Returns true when the
+   * message was a recognized command (handled or rejected) so the caller
+   * skips moderation. Kept regex-based to avoid spending an LLM call on
+   * what is unambiguous text.
+   */
+  private async handleWhitelistCommand(message: string, byUser: string): Promise<boolean> {
+    const match = message.trim().match(/^!(?:whitelist|wl)\s+(\w+)(?:\s+(.+))?$/i);
+    if (!match) return false;
+
+    const sub = match[1].toLowerCase();
+    const arg = (match[2] ?? '').trim();
+    const colorPrefix = this.colorPrefix();
+
+    if (sub === 'list' || sub === 'ls') {
+      const entries = await this.whitelistService.list();
+      if (entries.length === 0) {
+        this.messagesService.sendMessage(`${colorPrefix}@${byUser} 📭 Whitelist vacía.`);
+      } else {
+        const names = entries.map((e) => e.username).join(', ');
+        this.messagesService.sendMessage(
+          `${colorPrefix}@${byUser} 📋 Whitelist (${entries.length}): ${names}`,
+        );
+      }
+      return true;
+    }
+
+    if (sub === 'add') {
+      const target = arg.replace(/^@/, '').split(/\s+/)[0];
+      if (!target) {
+        this.messagesService.sendMessage(`${colorPrefix}@${byUser} Uso: !whitelist add <usuario> [nota]`);
+        return true;
+      }
+      const note = arg.slice(target.length).trim();
+      const inserted = await this.whitelistService.add(target, byUser, note);
+      this.messagesService.sendMessage(
+        inserted
+          ? `${colorPrefix}@${byUser} ✅ ${target} agregado a la whitelist.`
+          : `${colorPrefix}@${byUser} ℹ️ ${target} ya estaba en la whitelist.`,
+      );
+      this.logger.log(`📝 [WHITELIST] ${byUser} → add ${target} (${inserted ? 'nuevo' : 'duplicado'})`);
+      return true;
+    }
+
+    if (sub === 'remove' || sub === 'rm' || sub === 'del') {
+      const target = arg.replace(/^@/, '').split(/\s+/)[0];
+      if (!target) {
+        this.messagesService.sendMessage(`${colorPrefix}@${byUser} Uso: !whitelist remove <usuario>`);
+        return true;
+      }
+      const removed = await this.whitelistService.remove(target);
+      this.messagesService.sendMessage(
+        removed
+          ? `${colorPrefix}@${byUser} 🗑️ ${target} removido de la whitelist.`
+          : `${colorPrefix}@${byUser} ℹ️ ${target} no estaba en la whitelist.`,
+      );
+      this.logger.log(`📝 [WHITELIST] ${byUser} → remove ${target} (${removed ? 'ok' : 'no-op'})`);
+      return true;
+    }
+
+    // Unknown subcommand — reply with usage to make discovery easy.
+    this.messagesService.sendMessage(
+      `${colorPrefix}@${byUser} Comandos: !whitelist add <user> [nota] | remove <user> | list`,
+    );
+    return true;
   }
 
   // ── GPT moderation-control commands ────────────────────────────────────
