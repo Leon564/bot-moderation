@@ -318,6 +318,7 @@ EJEMPLOS:
 - "puto" usado contra alguien → eliminar.
 - "qué puto crack ese personaje" → permitir (admiración).
 - "Gays-----------" o "AAAAAAA" → eliminar (spam).
+- "Holaaaaaa", "Buenaaaaaas", "siiiiii", "noooooo", "graciasssss" → permitir (saludo / expresión enfática, no es spam aunque tenga letras repetidas).
 - "no me gustó el final" / "esa escena fue un asco" → permitir (opinión).
 - "mi número es 555-1234" → eliminar (info personal).
 - "@user crees que…" → permitir (mención normal).
@@ -554,6 +555,27 @@ action:
   }
 
   /**
+   * Heuristic: does the message look like a real word stretched out for
+   * emphasis ("Holaaaaaa", "Buenaaaaas", "siiiii", "nooooo"), as opposed to
+   * raw character spam ("AAAAAAA", "kkkkkkkkk")? Collapses any run of 3+
+   * identical letters down to one and counts the remaining letters; if the
+   * skeleton has at least 3 letters we trust the LLM to judge it.
+   */
+  private looksLikeStretchedWord(message: string): boolean {
+    const collapsed = message
+      .replace(/([a-záéíóúñü])\1{2,}/gi, '$1')
+      .replace(/[^a-záéíóúñü]/gi, '');
+    if (collapsed.length >= 3) return true;
+    // Words of 2 letters ("si", "no", "ok") still count if the original had
+    // at least one vowel + one consonant in different positions — i.e. it's
+    // a real short word stretched for emphasis, not a single key mashed.
+    if (collapsed.length === 2 && /[aeiouáéíóú]/i.test(collapsed) && /[^aeiouáéíóú]/i.test(collapsed)) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
    * Catches obvious junk before any LLM call. All pattern checks run against
    * the normalized text so leetspeak / spacing / confusables don't slip
    * through. The original message is what the LLM sees later.
@@ -587,7 +609,11 @@ action:
       return null;
     }
 
-    if (this.REPEATED_CHAR_RE.test(trimmed)) {
+    if (this.REPEATED_CHAR_RE.test(trimmed) && !this.looksLikeStretchedWord(trimmed)) {
+      // Only block when collapsing the repeats leaves no recognizable word
+      // ("AAAAAAA", "----------"). Stretched greetings/expressions like
+      // "Holaaaaaa" or "Buenaaaaas" still match the regex but collapse to a
+      // real word — let the LLM judge those instead of pre-filtering them.
       return {
         isAllowed: false,
         severity: 'medium',
