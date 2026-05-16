@@ -276,12 +276,11 @@ export class BotService implements OnModuleInit {
     }
 
     if (sub === 'add') {
-      const target = arg.replace(/^@/, '').split(/\s+/)[0];
+      const { target, note } = this.parseWhitelistTarget(arg);
       if (!target) {
         this.messagesService.sendMessage(`${colorPrefix}@${byUser} Uso: !whitelist add <usuario> [nota]`);
         return true;
       }
-      const note = arg.slice(target.length).trim();
       const inserted = await this.whitelistService.add(target, byUser, note);
       this.messagesService.sendMessage(
         inserted
@@ -293,7 +292,7 @@ export class BotService implements OnModuleInit {
     }
 
     if (sub === 'remove' || sub === 'rm' || sub === 'del') {
-      const target = arg.replace(/^@/, '').split(/\s+/)[0];
+      const { target } = this.parseWhitelistTarget(arg);
       if (!target) {
         this.messagesService.sendMessage(`${colorPrefix}@${byUser} Uso: !whitelist remove <usuario>`);
         return true;
@@ -313,6 +312,25 @@ export class BotService implements OnModuleInit {
       `${colorPrefix}@${byUser} Comandos: !whitelist add <user> [nota] | remove <user> | list`,
     );
     return true;
+  }
+
+  /**
+   * Parse the argument of `!wl add|remove` into `{ target, note }`.
+   *
+   * Accepts the chat's mention syntax `<@username>` so usernames that contain
+   * spaces or emojis survive intact (e.g. `<@Lyna 🫧>` → `Lyna 🫧`). Without
+   * this, splitting on whitespace would clip the username at the first space
+   * and dump the tail into the note field.
+   */
+  private parseWhitelistTarget(arg: string): { target: string; note: string } {
+    const mention = arg.match(/^<@\s*([^>]+?)\s*>\s*(.*)$/);
+    if (mention) {
+      return { target: mention[1], note: mention[2].trim() };
+    }
+    const stripped = arg.replace(/^@/, '');
+    const firstSpace = stripped.search(/\s/);
+    if (firstSpace === -1) return { target: stripped, note: '' };
+    return { target: stripped.slice(0, firstSpace), note: stripped.slice(firstSpace + 1).trim() };
   }
 
   // ── GPT moderation-control commands ────────────────────────────────────

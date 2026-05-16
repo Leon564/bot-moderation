@@ -101,7 +101,10 @@ export class WhitelistService implements OnModuleInit {
     }
     try {
       const docs = await this.model.find({}, { username: 1 }).lean();
-      this.cache = new Set(docs.map((d) => d.username));
+      // Lowercase defensively: Mongoose enforces `lowercase: true` on writes
+      // through the schema, but manual edits in Mongo bypass that and would
+      // otherwise miss the `isWhitelisted` lookup (which lowercases the query).
+      this.cache = new Set(docs.map((d) => d.username.toLowerCase()));
       this.cachedAt = now;
       return this.cache;
     } catch (err) {
